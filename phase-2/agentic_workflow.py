@@ -163,36 +163,41 @@ def main():
     # Run the workflow
     print("\n*** Workflow execution started ***\n")
     
-    # Workflow Prompt (updated to create a complete project development plan)
+    # Formulate a customized roadmap prompt to capture user stories, product features, and engineering tasks
     workflow_prompt = (
-        "Create a complete project development plan for the Email Router product. "
-        "Include user stories, product features, and detailed engineering tasks."
+        "Formulate a comprehensive product development roadmap for the Email Router. "
+        "Ensure it defines user stories, lists core product features, and outlines the engineering tasks required."
     )
     print(f"Task to complete in this workflow, workflow prompt = {workflow_prompt}")
 
-    print("\nDefining workflow steps from the workflow prompt")
+    print("\nDeconstructing prompt into workflow steps...")
     # TODO: 12 - Implement the workflow.
-    workflow_steps = action_planning_agent.respond(workflow_prompt)
-    print(f"Workflow steps: {workflow_steps}")
+    execution_steps = action_planning_agent.respond(workflow_prompt)
+    print(f"Workflow steps: {execution_steps}")
 
-    completed_steps = []
+    workflow_records = []
 
-    for step in workflow_steps:
+    for index, current_step in enumerate(execution_steps, start=1):
         print(f"\n{'='*60}")
-        print(f"Processing step: {step}")
+        print(f"[Step {index}/{len(execution_steps)}] Executing: {current_step}")
         print(f"{'='*60}")
 
-        result = routing_agent.route(step)
-        completed_steps.append({"step": step, "result": result})
-        print(result)
+        step_output = routing_agent.route(current_step)
+        workflow_records.append({
+            "step_name": current_step,
+            "step_output": step_output
+        })
+        print(step_output)
 
-    print("\n=== Final Email Router Project Plan ===")
-    for item in completed_steps:
-        print(f"\n## Workflow Step: {item['step']}")
-        print(item["result"])
+    print("\n" + "="*60)
+    print("=== EMAIL ROUTER - INTEGRATED DEVELOPMENT ROADMAP ===")
+    print("="*60)
+    for record in workflow_records:
+        print(f"\n### Phase: {record['step_name']}")
+        print(record['step_output'])
 
     print(f"\n{'='*60}")
-    print("*** Workflow execution completed ***")
+    print("*** Roadmap Generation Completed ***")
     print(f"{'='*60}")
 
 if __name__ == "__main__":
