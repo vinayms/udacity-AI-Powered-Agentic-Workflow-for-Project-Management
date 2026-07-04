@@ -1,5 +1,9 @@
 import math
+import json
+import logging
 from openai import OpenAI
+
+logger = logging.getLogger("workflow_agents")
 
 def cosine_similarity(v1, v2):
     dot_product = sum(a * b for a, b in zip(v1, v2))
@@ -11,6 +15,7 @@ def cosine_similarity(v1, v2):
 
 def create_client(openai_api_key):
     base_url = "https://openai.vocareum.com/v1" if openai_api_key and openai_api_key.startswith("voc-") else None
+    logger.debug(f"Creating OpenAI client (base_url: {base_url or 'default'})")
     return OpenAI(api_key=openai_api_key, base_url=base_url)
 
 
@@ -20,6 +25,7 @@ class DirectPromptAgent:
         self.client = create_client(self.openai_api_key)
 
     def respond(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Sending direct prompt to LLM...")
         response = self.client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -36,6 +42,7 @@ class AugmentedPromptAgent:
         self.client = create_client(self.openai_api_key)
 
     def respond(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Sending augmented prompt with persona: {self.persona}")
         response = self.client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
@@ -54,6 +61,7 @@ class KnowledgeAugmentedPromptAgent:
         self.client = create_client(self.openai_api_key)
 
     def respond(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Sending prompt with persona and specific knowledge context...")
         system_message = (
             f"You are {self.persona} knowledge-based assistant. Forget all previous context.\n"
             f"Use only the following knowledge to answer, do not use your own knowledge: {self.knowledge}\n"
@@ -80,6 +88,7 @@ class RAGKnowledgePromptAgent:
         self.embeddings = []
 
     def chunk_text(self, text):
+        logger.info(f"[{self.__class__.__name__}] Chunking knowledge text (size: {self.chunk_size}, overlap: {self.chunk_overlap})...")
         chunks = []
         start = 0
         if not text:
@@ -95,6 +104,7 @@ class RAGKnowledgePromptAgent:
         return chunks
 
     def calculate_embeddings(self):
+        logger.info(f"[{self.__class__.__name__}] Calculating embeddings for {len(self.chunks)} text chunks...")
         embeddings = []
         for chunk in self.chunks:
             response = self.client.embeddings.create(
@@ -106,6 +116,7 @@ class RAGKnowledgePromptAgent:
         return embeddings
 
     def find_prompt_in_knowledge(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Querying prompt in retrieved vector embeddings...")
         # Generate prompt embedding
         prompt_resp = self.client.embeddings.create(
             input=prompt,
@@ -121,6 +132,8 @@ class RAGKnowledgePromptAgent:
             if sim > best_similarity:
                 best_similarity = sim
                 best_chunk = chunk
+
+        logger.info(f"[{self.__class__.__name__}] Selected best chunk with similarity score: {best_similarity:.4f}")
 
         # Query LLM with RAG context
         system_message = (
@@ -156,17 +169,21 @@ class EvaluationAgent:
 
         while iterations < self.max_interactions:
             iterations += 1
-            # 1. Get response from worker agent
+            logger.info(f"[{self.__class__.__name__}] Iteration {iterations}/{self.max_interactions}: Fetching worker response...")
             worker_response = self.worker_agent.respond(current_prompt)
 
-            # 2. Evaluate worker response
+            logger.info(f"[{self.__class__.__name__}] Iteration {iterations}/{self.max_interactions}: Evaluating response against criteria...")
             eval_system = f"You are {self.persona}."
             eval_user = (
                 f"Evaluate the worker response against the evaluation criteria.\n"
                 f"Criteria: {self.evaluation_criteria}\n"
                 f"Worker Response: {worker_response}\n\n"
-                f"If the response meets the criteria, output exactly 'VALID'. "
-                f"If it does not meet the criteria, list the specific reasons why."
+                f"Respond with a JSON object in this exact format:\n"
+                f"{{\n"
+                f"  \"status\": \"VALID\" or \"INVALID\",\n"
+                f"  \"issues\": [\"list of specific reasons why it does not meet criteria, if INVALID\"]\n"
+                f"}}\n"
+                f"Do not include any other text, markdown formatting, or wrappers."
             )
             eval_response = self.client.chat.completions.create(
                 model="gpt-3.5-turbo",
@@ -176,22 +193,50 @@ class EvaluationAgent:
                 ],
                 temperature=0
             )
-            evaluation_result = eval_response.choices[0].message.content.strip()
+            
+            raw_eval_result = eval_response.choices[0].message.content.strip()
+            logger.debug(f"[{self.__class__.__name__}] Raw evaluation response: {raw_eval_result}")
 
-            if "VALID" in evaluation_result.upper():
+            # Try parsing JSON
+            status = "INVALID"
+            issues = []
+            try:
+                # Remove json block backticks if LLM mistakenly returned markdown json code block
+                cleaned_result = raw_eval_result
+                if cleaned_result.startswith("```"):
+                    lines = cleaned_result.splitlines()
+                    if len(lines) > 2:
+                        cleaned_result = "\n".join(lines[1:-1])
+                
+                parsed_json = json.loads(cleaned_result)
+                status = parsed_json.get("status", "INVALID").upper()
+                issues = parsed_json.get("issues", [])
+            except Exception as e:
+                logger.warning(f"[{self.__class__.__name__}] Failed to parse JSON response: {e}. Falling back to text-based matching.")
+                if "VALID" in raw_eval_result.upper():
+                    status = "VALID"
+                else:
+                    issues = [raw_eval_result]
+
+            if status == "VALID":
+                logger.info(f"[{self.__class__.__name__}] Response evaluated as VALID after {iterations} iterations.")
                 return {
                     "final_response": worker_response,
                     "evaluation": "VALID",
                     "iterations": iterations
                 }
 
-            # 3. Generate correction instructions
+            evaluation_result = ", ".join(issues) if issues else "INVALID response format"
+            logger.info(f"[{self.__class__.__name__}] Response evaluated as INVALID: {evaluation_result}")
+
+            # Generate correction instructions
+            logger.info(f"[{self.__class__.__name__}] Iteration {iterations}/{self.max_interactions}: Generating correction instructions...")
             correct_system = f"You are {self.persona}."
             correct_user = (
                 f"The worker response did not meet the criteria.\n"
                 f"Criteria: {self.evaluation_criteria}\n"
                 f"Worker Response: {worker_response}\n"
-                f"Evaluation: {evaluation_result}\n\n"
+                f"Issues identified: {evaluation_result}\n\n"
                 f"Generate clear and direct instructions telling the worker agent how to correct their response to meet the criteria."
             )
             correct_response = self.client.chat.completions.create(
@@ -203,6 +248,7 @@ class EvaluationAgent:
                 temperature=0
             )
             correction_instructions = correct_response.choices[0].message.content.strip()
+            logger.debug(f"[{self.__class__.__name__}] Correction instructions: {correction_instructions}")
 
             # Update prompt for next iteration
             current_prompt = (
@@ -212,6 +258,7 @@ class EvaluationAgent:
                 f"Please provide a new response that fully addresses the prompt and these instructions."
             )
 
+        logger.warning(f"[{self.__class__.__name__}] Reached max interactions ({self.max_interactions}) without obtaining a valid response.")
         return {
             "final_response": worker_response,
             "evaluation": evaluation_result,
@@ -234,6 +281,7 @@ class RoutingAgent:
         return response.data[0].embedding
 
     def route(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Routing prompt: {prompt}")
         prompt_embedding = self.get_embedding(prompt)
         best_similarity = -1.0
         selected_agent = None
@@ -241,12 +289,16 @@ class RoutingAgent:
         for agent in self.agents:
             desc_embedding = self.get_embedding(agent["description"])
             sim = cosine_similarity(prompt_embedding, desc_embedding)
+            logger.debug(f"[{self.__class__.__name__}] Similarity to agent '{agent['name']}': {sim:.4f}")
             if sim > best_similarity:
                 best_similarity = sim
                 selected_agent = agent
 
         if selected_agent:
+            logger.info(f"[{self.__class__.__name__}] Routing to selected agent: {selected_agent['name']} (similarity: {best_similarity:.4f})")
             return selected_agent["func"](prompt)
+        
+        logger.warning(f"[{self.__class__.__name__}] No suitable agent found for prompt.")
         return "No suitable agent found."
 
 
@@ -257,6 +309,7 @@ class ActionPlanningAgent:
         self.client = create_client(self.openai_api_key)
 
     def respond(self, prompt):
+        logger.info(f"[{self.__class__.__name__}] Generating action plan steps for prompt...")
         system_message = (
             "You are an Action Planning Agent. Your task is to extract and list the chronological "
             "steps required to execute the task described in the user's prompt. "
@@ -292,4 +345,6 @@ class ActionPlanningAgent:
             
             if cleaned_line:
                 steps.append(cleaned_line)
+        
+        logger.info(f"[{self.__class__.__name__}] Extracted {len(steps)} plan steps.")
         return steps
